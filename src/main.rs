@@ -359,5 +359,12 @@ fn main() {
     let _ = terminal::disable_raw_mode();
     // Dropping the stream stops playback.
     drop(stream);
-    execute!(stdout(), MoveTo(0, 0), Print("\nnoise stopped — bye!\n")).ok();
+
+    // Wipe the status panel so nothing is left on screen, then say goodbye.
+    let _ = execute!(
+        stdout(),
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        Print("noise stopped — bye!\n"),
+    );
 }
