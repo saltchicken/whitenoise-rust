@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
+use crossterm::Command;
 use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -227,6 +228,111 @@ fn format_signed_pct(v: i8) -> String {
     }
 }
 
+/// A single cell of text (optionally bold) within a row.
+struct Cell {
+    text: String,
+    bold: bool,
+    color: Color,
+}
+
+/// A row of the status panel: a bold label, a value, and (optionally) a
+/// right-aligned accent, separated by fixed gaps. The row is padded to the
+/// live terminal width so the right-hand border always lands on the same
+/// column, no matter how wide or narrow the viewport is.
+struct Row {
+    label: String,
+    value: String,
+    bold_value: bool,
+    value_color: Color,
+    accent: Option<String>,
+    accent_bold: bool,
+    accent_color: Color,
+}
+
+impl Row {
+    /// Render the row as `[left-pad][label][gap][value][gap][right-pad][accent]`.
+    ///
+    /// `inner_width` is the box interior (terminal width minus the 4 border
+    /// columns). The right padding is computed so the accent sits flush against
+    /// the right border. If the content is wider than the terminal (a very
+    /// narrow viewport) the padding clamps to zero so we degrade gracefully
+    /// instead of overflowing the box.
+    fn cells(&self, inner_width: usize) -> Vec<Cell> {
+        let label_w = self.label.chars().count();
+        let value_w = self.value.chars().count();
+        let accent_w = self.accent.as_ref().map_or(0, |a| a.chars().count());
+
+        let left_pad = "  ";
+        let gap1 = "  ";
+        let gap2 = "  ";
+
+        let fixed = left_pad.chars().count()
+            + label_w
+            + gap1.chars().count()
+            + value_w
+            + gap2.chars().count()
+            + accent_w;
+
+        let right_pad = inner_width.saturating_sub(fixed);
+
+        let mut cells = vec![
+            Cell {
+                text: left_pad.to_string(),
+                bold: false,
+                color: Color::Grey,
+            },
+            Cell {
+                text: self.label.clone(),
+                bold: true,
+                color: Color::White,
+            },
+            Cell {
+                text: gap1.to_string(),
+                bold: false,
+                color: self.value_color,
+            },
+            Cell {
+                text: self.value.clone(),
+                bold: self.bold_value,
+                color: self.value_color,
+            },
+            Cell {
+                text: gap2.to_string(),
+                bold: false,
+                color: self.value_color,
+            },
+        ];
+        if right_pad > 0 {
+            cells.push(Cell {
+                text: " ".repeat(right_pad),
+                bold: false,
+                color: self.value_color,
+            });
+        }
+        if let Some(accent) = &self.accent {
+            cells.push(Cell {
+                text: accent.clone(),
+                bold: self.accent_bold,
+                color: self.accent_color,
+            });
+        }
+        cells
+    }
+}
+
+/// Append a crossterm `Command`'s ANSI escape sequence to `out`.
+///
+/// The `Command` trait isn't `dyn`-compatible (its `write_ansi` takes a
+/// generic `impl fmt::Write`), so we can't keep heterogeneous commands in a
+/// `Vec<Box<dyn Command>>`; serializing each one into one string avoids that
+/// and also collapses the writes into a single stdout syscall.
+fn push_command<C: Command>(out: &mut String, cmd: C) -> std::io::Result<()> {
+    let mut buf = String::new();
+    cmd.write_ansi(&mut buf).map_err(std::io::Error::other)?;
+    out.push_str(&buf);
+    Ok(())
+}
+
 /// Paint the status panel describing the current state.
 fn render(
     volume: u8,
@@ -235,6 +341,13 @@ fn render(
     osc_amount: u8,
     osc_pos: i8,
 ) -> std::io::Result<()> {
+    // Resolve the actual terminal width so the box always fits the real
+    // viewport instead of a hard-coded ~65-column frame that overflows narrow
+    // terminals or looks sparse on wide ones.
+    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let inner = width.saturating_sub(4); // interior = width - ("│" + "│" + two side spaces)
+    let border_inner = width.saturating_sub(2); // dash run between ┌ and ┐
+
     let filled = (volume as usize) / 5; // 0..=20 segments
     let mut bar = String::with_capacity(22);
     bar.push('│');
@@ -279,38 +392,105 @@ fn render(
     let range_str = format!("±{}%", osc_amount.min(100));
     let pos_str = format_signed_pct(if osc_enabled { osc_pos } else { 0 });
 
-    execute!(
-        stdout(),
-        MoveTo(0, 0),
-        SetStyle(ContentStyle::default()),
-        SetForegroundColor(Color::White),
-        SetAttribute(Attribute::Bold),
-        Print("   ┌────────────────────────── noise ───────────────────────────┐\n"),
-        SetAttribute(Attribute::Reset),
-        SetForegroundColor(Color::Grey),
-        Print("   │  mode    : "),
-        SetForegroundColor(Color::Yellow),
-        Print(format!("{:<20}", mode_label)),
-        SetForegroundColor(Color::Grey),
-        Print("                            │\n   │  osc     : "),
-        SetForegroundColor(osc_color),
-        Print(format!(
-            "{:>3}s  {:<5}  {slider}  {pos_str}",
-            osc_secs, range_str
-        )),
-        SetForegroundColor(Color::Grey),
-        Print("   │\n   │  volume  : "),
-        SetForegroundColor(Color::Cyan),
-        Print(format!("{bar} {:>3}%", volume)),
-        SetForegroundColor(Color::Grey),
-        Print(
-            "                     │\n   │                                                            │\n"
-        ),
-        SetForegroundColor(Color::DarkGrey),
-        Print("   │  controls: ↑/↓ vol  ←/→ cycle  +/- range  o osc  q quit    │\n"),
-        SetStyle(ContentStyle::default()),
-        Print("   └────────────────────────────────────────────────────────────┘\n"),
-    )
+    // Model each row as data; the `Row` helper pads it to the live terminal
+    // width so the right-hand border always lines up.
+    let mode = Row {
+        label: "mode".to_string(),
+        value: mode_label.to_string(),
+        bold_value: true,
+        value_color: Color::Yellow,
+        accent: None,
+        accent_bold: false,
+        accent_color: Color::White,
+    };
+    let osc = Row {
+        label: "osc".to_string(),
+        value: format!("{:>3}s  {:<5}  {slider}", osc_secs, range_str),
+        bold_value: true,
+        value_color: osc_color,
+        accent: Some(pos_str),
+        accent_bold: false,
+        accent_color: Color::White,
+    };
+    let volume_row = Row {
+        label: "volume".to_string(),
+        value: format!("{bar} {:>3}%", volume),
+        bold_value: true,
+        value_color: Color::Cyan,
+        accent: None,
+        accent_bold: false,
+        accent_color: Color::White,
+    };
+    let controls = Row {
+        label: "controls".to_string(),
+        value: "↑/↓ vol  ←/→ cycle  +/- range  o osc  q quit".to_string(),
+        bold_value: false,
+        value_color: Color::DarkGrey,
+        accent: None,
+        accent_bold: false,
+        accent_color: Color::White,
+    };
+    let rows = [mode, osc, volume_row, controls];
+
+    // Top border with a centered title and a bottom border, both sized to the
+    // live width (no hand-counted dashes).
+    let title = " noise ";
+    let title_w = title.chars().count();
+    let left_pad = if border_inner > title_w {
+        (border_inner - title_w) / 2
+    } else {
+        0
+    };
+    let right_pad = if border_inner > title_w {
+        border_inner - title_w - left_pad
+    } else {
+        0
+    };
+    let top = format!(
+        "┌{}{}{}┐",
+        "─".repeat(left_pad),
+        title,
+        "─".repeat(right_pad)
+    );
+    let bottom = format!("└{}┘", "─".repeat(border_inner));
+
+    // Serialize every command (styling + text) into a single ANSI string and
+    // write it in one shot.
+    let mut out = String::with_capacity(1024);
+    push_command(&mut out, MoveTo(0, 0))?;
+    push_command(&mut out, SetStyle(ContentStyle::default()))?;
+    push_command(&mut out, SetAttribute(Attribute::Bold))?;
+    push_command(&mut out, SetForegroundColor(Color::White))?;
+    push_command(&mut out, Print(top))?;
+    push_command(&mut out, SetAttribute(Attribute::Reset))?;
+
+    for row in &rows {
+        for c in row.cells(inner) {
+            push_command(
+                &mut out,
+                if c.bold {
+                    SetAttribute(Attribute::Bold)
+                } else {
+                    SetAttribute(Attribute::Reset)
+                },
+            )?;
+            push_command(&mut out, SetForegroundColor(c.color))?;
+            push_command(&mut out, Print(c.text))?;
+        }
+        push_command(&mut out, SetStyle(ContentStyle::default()))?;
+        push_command(&mut out, SetForegroundColor(Color::Grey))?;
+        push_command(&mut out, Print("│"))?;
+        push_command(&mut out, Print("\n"))?;
+    }
+
+    push_command(&mut out, SetAttribute(Attribute::Bold))?;
+    push_command(&mut out, SetForegroundColor(Color::White))?;
+    push_command(&mut out, Print(bottom))?;
+    push_command(&mut out, SetStyle(ContentStyle::default()))?;
+    push_command(&mut out, Print("\n"))?;
+
+    std::io::Write::write_all(&mut stdout(), out.as_bytes())?;
+    Ok(())
 }
 
 /// Block until SIGINT, then flip `running` to false.
