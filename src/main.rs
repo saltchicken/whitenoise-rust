@@ -1,13 +1,14 @@
 /// # noise
 ///
-/// A continuous white / pink / brown noise generator that plays to your
-/// default audio output device until you press `Ctrl+C`.
+/// A continuous white / pink / brown / oscillating pink↔brown noise generator
+/// that plays to your default audio output device until you press `Ctrl+C`.
 ///
 /// Controls:
-/// * `Up` / `Down` — increase / decrease volume (5% steps).
-/// * `n`           — cycle the noise type (White → Pink → Brown).
-/// * `q` or `Esc`  — quit.
-/// * `Ctrl+C`      — quit.
+/// * `Up` / `Down`    — increase / decrease volume (5% steps).
+/// * `Left` / `Right` — decrease / increase Pink↔Brown cycle length (5s steps).
+/// * `n`              — cycle the noise type (White → Pink → Brown → Pink↔Brown).
+/// * `q` or `Esc`     — quit.
+/// * `Ctrl+C`         — quit.
 use std::io::stdout;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -44,10 +45,14 @@ struct NoiseGen {
     p6: f64,
     /// Brown-noise (AR(1)) integrator state.
     brown: f64,
+    /// LFO phase in `[0.0, 1.0)` for Pink↔Brown oscillation.
+    phase: f64,
+    /// Interleaved samples per second (`sample_rate * channels`).
+    samples_per_sec: f64,
 }
 
 impl NoiseGen {
-    fn new() -> Self {
+    fn new(samples_per_sec: f64) -> Self {
         // Seed from the wall clock so successive runs differ.
         let mut seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -67,6 +72,8 @@ impl NoiseGen {
             p5: 0.0,
             p6: 0.0,
             brown: 0.0,
+            phase: 0.0,
+            samples_per_sec: samples_per_sec.max(1.0),
         }
     }
 
@@ -116,18 +123,42 @@ impl NoiseGen {
         self.brown * 3.5
     }
 
+    /// Cosine ease in `[0.0, 1.0]` derived from the current LFO phase
+    /// (`0.0` = Pink, `1.0` = Brown).
+    fn current_mix(&self) -> f64 {
+        0.5 * (1.0 - (self.phase * std::f64::consts::TAU).cos())
+    }
+
     /// Produce one output sample (in ~`[-1, 1]`) for the requested type.
-    fn sample(&mut self, noise_type: usize) -> f64 {
+    fn sample(&mut self, noise_type: usize, period_secs: usize) -> f64 {
         if noise_type != self.current {
             self.reset();
+            self.phase = 0.0;
             self.current = noise_type;
         }
-        let w = self.white();
         match noise_type {
-            0 => w,
-            1 => self.pink(w),
-            2 => self.brown(w),
-            _ => w,
+            0 => self.white(),
+            1 => {
+                let w = self.white();
+                self.pink(w)
+            }
+            2 => {
+                let w = self.white();
+                self.brown(w)
+            }
+            3 => {
+                let period_samples = (period_secs.max(1) as f64) * self.samples_per_sec;
+                self.phase = (self.phase + 1.0 / period_samples) % 1.0;
+                let mix = self.current_mix();
+
+                // Separate white sources + equal-power crossfade avoids a mid-slide loudness dip.
+                let w_pink = self.white();
+                let w_brown = self.white();
+                let p = self.pink(w_pink);
+                let b = self.brown(w_brown);
+                p * (1.0 - mix).sqrt() + b * mix.sqrt()
+            }
+            _ => self.white(),
         }
     }
 }
@@ -138,6 +169,7 @@ fn noise_name(noise_type: usize) -> &'static str {
         0 => "White",
         1 => "Pink",
         2 => "Brown",
+        3 => "Pink↔Brown",
         _ => "White",
     }
 }
@@ -147,22 +179,30 @@ fn create_stream(
     device: &Device,
     volume: Arc<AtomicU8>,
     noise_type: Arc<AtomicUsize>,
+    osc_secs: Arc<AtomicUsize>,
+    osc_mix: Arc<AtomicU8>,
 ) -> Result<Stream, String> {
     let config = device
         .default_output_config()
         .map_err(|e| format!("no output config: {e}"))?;
+    let samples_per_sec = config.sample_rate().0 as f64 * config.channels() as f64;
 
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
-            let mut r#gen = NoiseGen::new();
+            let mut r#gen = NoiseGen::new(samples_per_sec);
             device
                 .build_output_stream(
                     &config.config(),
                     move |buffer: &mut [f32], _| {
                         let gain = volume.load(Ordering::Relaxed) as f32 / 100.0;
                         let t = noise_type.load(Ordering::Relaxed);
+                        let period = osc_secs.load(Ordering::Relaxed);
                         for s in buffer.iter_mut() {
-                            *s = (r#gen.sample(t) as f32 * gain).clamp(-1.0, 1.0);
+                            *s = (r#gen.sample(t, period) as f32 * gain).clamp(-1.0, 1.0);
+                        }
+                        if t == 3 {
+                            let mix_pct = (r#gen.current_mix() * 100.0).round() as u8;
+                            osc_mix.store(mix_pct, Ordering::Relaxed);
                         }
                     },
                     |err| eprintln!("audio stream error: {err}"),
@@ -171,16 +211,21 @@ fn create_stream(
                 .map_err(|e| e.to_string())?
         }
         SampleFormat::I16 => {
-            let mut r#gen = NoiseGen::new();
+            let mut r#gen = NoiseGen::new(samples_per_sec);
             device
                 .build_output_stream(
                     &config.config(),
                     move |buffer: &mut [i16], _| {
                         let gain = volume.load(Ordering::Relaxed) as f64 / 100.0;
                         let t = noise_type.load(Ordering::Relaxed);
+                        let period = osc_secs.load(Ordering::Relaxed);
                         for s in buffer.iter_mut() {
-                            let v = r#gen.sample(t) * gain * 32_767.0;
+                            let v = r#gen.sample(t, period) * gain * 32_767.0;
                             *s = v.clamp(-32_768.0, 32_767.0) as i16;
+                        }
+                        if t == 3 {
+                            let mix_pct = (r#gen.current_mix() * 100.0).round() as u8;
+                            osc_mix.store(mix_pct, Ordering::Relaxed);
                         }
                     },
                     |err| eprintln!("audio stream error: {err}"),
@@ -202,14 +247,33 @@ fn create_stream(
 }
 
 /// Paint the little status panel describing the current state.
-fn render(volume: u8, noise_type: usize) -> std::io::Result<()> {
+fn render(volume: u8, noise_type: usize, osc_secs: usize, osc_mix: u8) -> std::io::Result<()> {
     let filled = (volume as usize) / 5; // 0..=20 segments
-    let mut bar = String::with_capacity(21);
+    let mut bar = String::with_capacity(22);
     bar.push('│');
     for i in 0..20 {
         bar.push(if i < filled { '█' } else { '░' });
     }
     bar.push('│');
+
+    let slider_width = 15usize;
+    let pos = ((osc_mix.min(100) as usize) * (slider_width - 1) + 50) / 100;
+    let mut slider = String::with_capacity(slider_width + 2);
+    slider.push('[');
+    for i in 0..slider_width {
+        if noise_type == 3 && i == pos {
+            slider.push('●');
+        } else {
+            slider.push('─');
+        }
+    }
+    slider.push(']');
+
+    let cycle_color = if noise_type == 3 {
+        Color::Magenta
+    } else {
+        Color::DarkGrey
+    };
 
     execute!(
         stdout(),
@@ -217,20 +281,26 @@ fn render(volume: u8, noise_type: usize) -> std::io::Result<()> {
         SetStyle(ContentStyle::default()),
         SetForegroundColor(Color::White),
         SetAttribute(Attribute::Bold),
-        Print("   ┌────────────────────────── noise ──────────────────────────┐\n"),
+        Print("   ┌───────────────────────── noise ──────────────────────────┐\n"),
         SetAttribute(Attribute::Reset),
         SetForegroundColor(Color::Grey),
         Print("   │  type    : "),
         SetForegroundColor(Color::Yellow),
-        Print(format!("   {:<12}   ", noise_name(noise_type))),
+        Print(format!("{:<12}", noise_name(noise_type))),
         SetForegroundColor(Color::Grey),
-        Print("   │\n   │  volume  : "),
+        Print("                                  │\n   │  cycle   : "),
+        SetForegroundColor(cycle_color),
+        Print(format!("{:>3}s  Pink {slider} Brown", osc_secs)),
+        SetForegroundColor(Color::Grey),
+        Print("            │\n   │  volume  : "),
         SetForegroundColor(Color::Cyan),
         Print(format!("{bar} {:>3}%", volume)),
         SetForegroundColor(Color::Grey),
-        Print("\n   │\n"),
+        Print(
+            "                   │\n   │                                                          │\n"
+        ),
         SetForegroundColor(Color::DarkGrey),
-        Print("   │  controls:  ↑/↓ volume    n cycle type    q / Ctrl+C quit   │\n"),
+        Print("   │  controls: ↑/↓ vol   ←/→ cycle   n mode   q/Ctrl+C quit  │\n"),
         SetStyle(ContentStyle::default()),
         Print("   └──────────────────────────────────────────────────────────┘\n"),
     )
@@ -256,6 +326,8 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let volume = Arc::new(AtomicU8::new(20));
     let noise_type = Arc::new(AtomicUsize::new(1)); // 1 = Pink
+    let osc_secs = Arc::new(AtomicUsize::new(30)); // 30s Pink↔Brown cycle
+    let osc_mix = Arc::new(AtomicU8::new(0)); // 0..=100% Pink→Brown blend
 
     // Start audio.
     let host = cpal::default_host();
@@ -266,7 +338,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let stream = match create_stream(&device, volume.clone(), noise_type.clone()) {
+    let stream = match create_stream(
+        &device,
+        volume.clone(),
+        noise_type.clone(),
+        osc_secs.clone(),
+        osc_mix.clone(),
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -288,12 +366,16 @@ fn main() {
     let _ = render(
         volume.load(Ordering::Relaxed),
         noise_type.load(Ordering::Relaxed),
+        osc_secs.load(Ordering::Relaxed),
+        osc_mix.load(Ordering::Relaxed),
     );
 
     // Event loop: poll with a short timeout so we can also react to the
-    // signal handler thread.
+    // signal handler thread and animate the oscillation slider.
     let mut last_volume = volume.load(Ordering::Relaxed);
     let mut last_type = noise_type.load(Ordering::Relaxed);
+    let mut last_osc_secs = osc_secs.load(Ordering::Relaxed);
+    let mut last_osc_mix = osc_mix.load(Ordering::Relaxed);
     loop {
         if !running.load(Ordering::Relaxed) {
             break;
@@ -324,9 +406,20 @@ fn main() {
                                 volume.store(v.saturating_sub(5), Ordering::Relaxed);
                             }
                         }
+                        KeyCode::Right => {
+                            let s = osc_secs.load(Ordering::Relaxed);
+                            osc_secs.store((s + 5).min(300), Ordering::Relaxed);
+                        }
+                        KeyCode::Left => {
+                            let s = osc_secs.load(Ordering::Relaxed);
+                            osc_secs.store(s.saturating_sub(5).max(5), Ordering::Relaxed);
+                        }
                         KeyCode::Char('n') | KeyCode::Char('N') => {
-                            let t = noise_type.load(Ordering::Relaxed);
-                            noise_type.store((t + 1) % 3, Ordering::Relaxed);
+                            let next = (noise_type.load(Ordering::Relaxed) + 1) % 4;
+                            if next == 3 {
+                                osc_mix.store(0, Ordering::Relaxed);
+                            }
+                            noise_type.store(next, Ordering::Relaxed);
                         }
                         KeyCode::Char('q') | KeyCode::Esc => {
                             running.store(false, Ordering::SeqCst);
@@ -338,7 +431,7 @@ fn main() {
                 // Ignore non-key events and key repeats/releases.
                 _ => {}
             },
-            Ok(false) => continue,
+            Ok(false) => {}
             Err(e) => {
                 eprintln!("input error: {e}");
                 break;
@@ -348,10 +441,19 @@ fn main() {
         // Redraw only when something changed, to avoid flicker.
         let cur_volume = volume.load(Ordering::Relaxed);
         let cur_type = noise_type.load(Ordering::Relaxed);
-        if cur_volume != last_volume || cur_type != last_type {
+        let cur_osc_secs = osc_secs.load(Ordering::Relaxed);
+        let cur_osc_mix = osc_mix.load(Ordering::Relaxed);
+        let mix_changed = cur_type == 3 && cur_osc_mix != last_osc_mix;
+        if cur_volume != last_volume
+            || cur_type != last_type
+            || cur_osc_secs != last_osc_secs
+            || mix_changed
+        {
             last_volume = cur_volume;
             last_type = cur_type;
-            let _ = render(cur_volume, cur_type);
+            last_osc_secs = cur_osc_secs;
+            last_osc_mix = cur_osc_mix;
+            let _ = render(cur_volume, cur_type, cur_osc_secs, cur_osc_mix);
         }
     }
 
