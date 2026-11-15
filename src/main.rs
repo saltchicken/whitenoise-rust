@@ -123,10 +123,16 @@ impl NoiseGen {
         self.brown * 3.5
     }
 
-    /// Cosine ease in `[0.0, 1.0]` derived from the current LFO phase
-    /// (`0.0` = Pink, `1.0` = Brown).
+    /// Cosine-eased Pink↔Brown blend derived from the current LFO phase
+    /// (`0.0` = full Pink, `1.0` = full Brown).
+    ///
+    /// The swing is deliberately narrowed around the middle: it oscillates
+    /// over `0.5 ± 0.30` rather than the full `0.5 ± 0.5`. This keeps the
+    /// "Pink" extreme from ever being fully pink and the "Brown" extreme from
+    /// ever being fully brown — each point leans slightly toward the other
+    /// colour. Raise the `0.30` amplitude toward `0.5` for a wider swing.
     fn current_mix(&self) -> f64 {
-        0.5 * (1.0 - (self.phase * std::f64::consts::TAU).cos())
+        0.5 - 0.30 * (self.phase * std::f64::consts::TAU).cos()
     }
 
     /// Produce one output sample (in ~`[-1, 1]`) for the requested type.
