@@ -1,0 +1,9 @@
+[package]
+name = "whitenoise"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.15"
+crossterm = "0.28"
+signal-hook = "0.3"
