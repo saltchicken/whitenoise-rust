@@ -514,7 +514,7 @@ fn main() {
     let volume = Arc::new(AtomicU8::new(20));
     let osc_enabled = Arc::new(AtomicBool::new(true));
     let osc_secs = Arc::new(AtomicUsize::new(30)); // 30s full oscillation cycle
-    let osc_amount = Arc::new(AtomicU8::new(50)); // ±50% away from Brown
+    let osc_amount = Arc::new(AtomicU8::new(25)); // ±25% away from Brown
     let osc_pos = Arc::new(AtomicI8::new(0)); // current position in -100..=100%
 
     // Start audio.
