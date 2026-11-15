@@ -360,11 +360,6 @@ fn main() {
     // Dropping the stream stops playback.
     drop(stream);
 
-    // Wipe the status panel so nothing is left on screen, then say goodbye.
-    let _ = execute!(
-        stdout(),
-        Clear(ClearType::All),
-        MoveTo(0, 0),
-        Print("noise stopped — bye!\n"),
-    );
+    // Wipe the status panel so nothing is left on screen.
+    let _ = execute!(stdout(), Clear(ClearType::All));
 }
