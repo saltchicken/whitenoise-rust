@@ -8,6 +8,8 @@
 /// * `Left` / `Right` — decrease / increase oscillation cycle length (5s steps).
 /// * `+` / `-`        — increase / decrease oscillation range away from Brown (5% steps).
 /// * `o` or `Space`   — toggle oscillation on / off.
+/// * `r`              — toggle reverb on / off.
+/// * `[` / `]`        — decrease / increase reverb wet mix (5% steps).
 /// * `q` or `Esc`     — quit.
 /// * `Ctrl+C`         — quit.
 use std::io::stdout;
@@ -146,37 +148,253 @@ impl NoiseGen {
     }
 }
 
+/// Damped Schroeder comb filter for the Freeverb-style reverb tank.
+struct CombFilter {
+    buf: Vec<f64>,
+    idx: usize,
+    filter_store: f64,
+    damp1: f64,
+    damp2: f64,
+    feedback: f64,
+}
+
+impl CombFilter {
+    fn new(len: usize, feedback: f64, damp: f64) -> Self {
+        let len = len.max(1);
+        CombFilter {
+            buf: vec![0.0; len],
+            idx: 0,
+            filter_store: 0.0,
+            damp1: damp,
+            damp2: 1.0 - damp,
+            feedback,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f64) -> f64 {
+        let output = self.buf[self.idx];
+        self.filter_store = output * self.damp2 + self.filter_store * self.damp1;
+        self.buf[self.idx] = input + self.filter_store * self.feedback;
+        self.idx += 1;
+        if self.idx >= self.buf.len() {
+            self.idx = 0;
+        }
+        output
+    }
+}
+
+/// Unity-gain Schroeder allpass filter for reverb diffusion.
+struct AllpassFilter {
+    buf: Vec<f64>,
+    idx: usize,
+    feedback: f64,
+}
+
+impl AllpassFilter {
+    fn new(len: usize, feedback: f64) -> Self {
+        let len = len.max(1);
+        AllpassFilter {
+            buf: vec![0.0; len],
+            idx: 0,
+            feedback,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f64) -> f64 {
+        let delayed = self.buf[self.idx];
+        let v = input + self.feedback * delayed;
+        self.buf[self.idx] = v;
+        self.idx += 1;
+        if self.idx >= self.buf.len() {
+            self.idx = 0;
+        }
+        delayed - self.feedback * v
+    }
+}
+
+/// Single-channel Freeverb-style tank (8 parallel damped combs -> 4 series allpasses)
+/// with a gentle sub-bass high-pass filter on the tank input so Brown noise's
+/// deep bass does not build up coherently in the comb filters.
+struct ReverbChannel {
+    combs: [CombFilter; 8],
+    allpasses: [AllpassFilter; 4],
+    alpha_hp: f64,
+    hp_prev_x: f64,
+    hp_y: f64,
+}
+
+impl ReverbChannel {
+    // Classic Freeverb delay lengths at 44.1 kHz.
+    const COMB_TUNINGS: [usize; 8] = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+    const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
+    const STEREO_SPREAD: usize = 23;
+    const COMB_FEEDBACK: f64 = 0.85;
+    const ALLPASS_FEEDBACK: f64 = 0.5;
+    const COMB_SCALE: f64 = 1.0 / 6.0;
+
+    fn new(sample_rate: f64, channel_idx: usize) -> Self {
+        let sr = sample_rate.max(1.0);
+        let scale = sr / 44_100.0;
+        let spread = (channel_idx % 2) * Self::STEREO_SPREAD + (channel_idx / 2) * 11;
+        let tau = std::f64::consts::TAU;
+        let damp = (-tau * 4000.0 / sr).exp();
+        let alpha_hp = (-tau * 45.0 / sr).exp();
+
+        let scale_len =
+            |base: usize| -> usize { (((base + spread) as f64) * scale).round().max(1.0) as usize };
+
+        let combs = [
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[0]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[1]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[2]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[3]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[4]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[5]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[6]), Self::COMB_FEEDBACK, damp),
+            CombFilter::new(scale_len(Self::COMB_TUNINGS[7]), Self::COMB_FEEDBACK, damp),
+        ];
+
+        let allpasses = [
+            AllpassFilter::new(scale_len(Self::ALLPASS_TUNINGS[0]), Self::ALLPASS_FEEDBACK),
+            AllpassFilter::new(scale_len(Self::ALLPASS_TUNINGS[1]), Self::ALLPASS_FEEDBACK),
+            AllpassFilter::new(scale_len(Self::ALLPASS_TUNINGS[2]), Self::ALLPASS_FEEDBACK),
+            AllpassFilter::new(scale_len(Self::ALLPASS_TUNINGS[3]), Self::ALLPASS_FEEDBACK),
+        ];
+
+        ReverbChannel {
+            combs,
+            allpasses,
+            alpha_hp,
+            hp_prev_x: 0.0,
+            hp_y: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process_wet(&mut self, input: f64) -> f64 {
+        let hp = self.alpha_hp * (self.hp_y + input - self.hp_prev_x);
+        self.hp_prev_x = input;
+        self.hp_y = hp;
+
+        let mut acc = 0.0;
+        for comb in &mut self.combs {
+            acc += comb.process(hp);
+        }
+        let mut out = acc * Self::COMB_SCALE;
+        for allpass in &mut self.allpasses {
+            out = allpass.process(out);
+        }
+        out
+    }
+}
+
+/// Multi-channel stereo-spread reverb with click-free mix smoothing and
+/// equal-power dry/wet crossfade.
+struct Reverb {
+    channels: Vec<ReverbChannel>,
+    alpha_mix: f64,
+    mix: f64,
+    dry_gain: f64,
+    wet_gain: f64,
+}
+
+impl Reverb {
+    fn new(sample_rate: f64, num_channels: usize) -> Self {
+        let sr = sample_rate.max(1.0);
+        let n = num_channels.max(1);
+        let channels = (0..n).map(|ch| ReverbChannel::new(sr, ch)).collect();
+        Reverb {
+            channels,
+            alpha_mix: 1.0 - (-1.0 / (0.030 * sr)).exp(),
+            mix: 0.0,
+            dry_gain: 1.0,
+            wet_gain: 0.0,
+        }
+    }
+
+    /// Advance the smoothed wet mix once per audio frame so all channels share
+    /// the exact same crossfade gains.
+    #[inline]
+    fn begin_frame(&mut self, enabled: bool, mix_pct: u8) {
+        let target = if enabled {
+            (mix_pct.min(100) as f64) / 100.0
+        } else {
+            0.0
+        };
+        self.mix += self.alpha_mix * (target - self.mix);
+        let angle = self.mix * std::f64::consts::FRAC_PI_2;
+        self.dry_gain = angle.cos();
+        self.wet_gain = angle.sin();
+    }
+
+    /// Process one sample for `channel_idx` using the current frame's mix gains.
+    #[inline]
+    fn process_channel(&mut self, channel_idx: usize, dry: f64) -> f64 {
+        let wet = self.channels[channel_idx].process_wet(dry);
+        self.dry_gain * dry + self.wet_gain * wet
+    }
+}
+
+/// Shared lock-free parameters between the UI loop and the audio callback.
+struct AudioParams {
+    volume: AtomicU8,
+    osc_enabled: AtomicBool,
+    osc_secs: AtomicUsize,
+    osc_amount: AtomicU8,
+    osc_pos: AtomicI8,
+    reverb_enabled: AtomicBool,
+    reverb_mix: AtomicU8,
+}
+
+impl AudioParams {
+    fn new() -> Self {
+        AudioParams {
+            volume: AtomicU8::new(20),
+            osc_enabled: AtomicBool::new(true),
+            osc_secs: AtomicUsize::new(30), // 30s full oscillation cycle
+            osc_amount: AtomicU8::new(25),  // ±25% away from Brown
+            osc_pos: AtomicI8::new(0),      // current position in -100..=100%
+            reverb_enabled: AtomicBool::new(true),
+            reverb_mix: AtomicU8::new(35), // 35% wet mix
+        }
+    }
+}
+
 /// Build a playing output `Stream` for the requested device.
-fn create_stream(
-    device: &Device,
-    volume: Arc<AtomicU8>,
-    osc_enabled: Arc<AtomicBool>,
-    osc_secs: Arc<AtomicUsize>,
-    osc_amount: Arc<AtomicU8>,
-    osc_pos: Arc<AtomicI8>,
-) -> Result<Stream, String> {
+fn create_stream(device: &Device, params: Arc<AudioParams>) -> Result<Stream, String> {
     let config = device
         .default_output_config()
         .map_err(|e| format!("no output config: {e}"))?;
-    let samples_per_sec = config.sample_rate().0 as f64 * config.channels() as f64;
+    let sample_rate = config.sample_rate().0 as f64;
+    let channels = config.channels().max(1) as usize;
+    let samples_per_sec = sample_rate * channels as f64;
 
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             let mut r#gen = NoiseGen::new(samples_per_sec);
+            let mut reverb = Reverb::new(sample_rate, channels);
             device
                 .build_output_stream(
                     &config.config(),
                     move |buffer: &mut [f32], _| {
-                        let gain = volume.load(Ordering::Relaxed) as f32 / 100.0;
-                        let enabled = osc_enabled.load(Ordering::Relaxed);
-                        let period = osc_secs.load(Ordering::Relaxed);
-                        let amount = osc_amount.load(Ordering::Relaxed);
-                        for s in buffer.iter_mut() {
-                            *s = (r#gen.sample(enabled, period, amount) as f32 * gain)
-                                .clamp(-1.0, 1.0);
+                        let gain = params.volume.load(Ordering::Relaxed) as f32 / 100.0;
+                        let enabled = params.osc_enabled.load(Ordering::Relaxed);
+                        let period = params.osc_secs.load(Ordering::Relaxed);
+                        let amount = params.osc_amount.load(Ordering::Relaxed);
+                        let rev_enabled = params.reverb_enabled.load(Ordering::Relaxed);
+                        let rev_mix = params.reverb_mix.load(Ordering::Relaxed);
+                        for frame in buffer.chunks_mut(channels) {
+                            reverb.begin_frame(rev_enabled, rev_mix);
+                            for (ch, s) in frame.iter_mut().enumerate() {
+                                let dry = r#gen.sample(enabled, period, amount);
+                                let mixed = reverb.process_channel(ch, dry);
+                                *s = (mixed as f32 * gain).clamp(-1.0, 1.0);
+                            }
                         }
                         let pos_pct = (r#gen.current_offset() * 100.0).round() as i8;
-                        osc_pos.store(pos_pct, Ordering::Relaxed);
+                        params.osc_pos.store(pos_pct, Ordering::Relaxed);
                     },
                     |err| eprintln!("audio stream error: {err}"),
                     None,
@@ -185,20 +403,27 @@ fn create_stream(
         }
         SampleFormat::I16 => {
             let mut r#gen = NoiseGen::new(samples_per_sec);
+            let mut reverb = Reverb::new(sample_rate, channels);
             device
                 .build_output_stream(
                     &config.config(),
                     move |buffer: &mut [i16], _| {
-                        let gain = volume.load(Ordering::Relaxed) as f64 / 100.0;
-                        let enabled = osc_enabled.load(Ordering::Relaxed);
-                        let period = osc_secs.load(Ordering::Relaxed);
-                        let amount = osc_amount.load(Ordering::Relaxed);
-                        for s in buffer.iter_mut() {
-                            let v = r#gen.sample(enabled, period, amount) * gain * 32_767.0;
-                            *s = v.clamp(-32_768.0, 32_767.0) as i16;
+                        let gain = params.volume.load(Ordering::Relaxed) as f64 / 100.0;
+                        let enabled = params.osc_enabled.load(Ordering::Relaxed);
+                        let period = params.osc_secs.load(Ordering::Relaxed);
+                        let amount = params.osc_amount.load(Ordering::Relaxed);
+                        let rev_enabled = params.reverb_enabled.load(Ordering::Relaxed);
+                        let rev_mix = params.reverb_mix.load(Ordering::Relaxed);
+                        for frame in buffer.chunks_mut(channels) {
+                            reverb.begin_frame(rev_enabled, rev_mix);
+                            for (ch, s) in frame.iter_mut().enumerate() {
+                                let dry = r#gen.sample(enabled, period, amount);
+                                let v = reverb.process_channel(ch, dry) * gain * 32_767.0;
+                                *s = v.clamp(-32_768.0, 32_767.0) as i16;
+                            }
                         }
                         let pos_pct = (r#gen.current_offset() * 100.0).round() as i8;
-                        osc_pos.store(pos_pct, Ordering::Relaxed);
+                        params.osc_pos.store(pos_pct, Ordering::Relaxed);
                     },
                     |err| eprintln!("audio stream error: {err}"),
                     None,
@@ -340,6 +565,8 @@ fn render(
     osc_secs: usize,
     osc_amount: u8,
     osc_pos: i8,
+    reverb_enabled: bool,
+    reverb_mix: u8,
 ) -> std::io::Result<()> {
     // Resolve the actual terminal width so the box always fits the real
     // viewport instead of a hard-coded ~65-column frame that overflows narrow
@@ -355,6 +582,18 @@ fn render(
         bar.push(if i < filled { '█' } else { '░' });
     }
     bar.push('│');
+
+    let rev_filled = if reverb_enabled {
+        (reverb_mix.min(100) as usize) / 5
+    } else {
+        0
+    };
+    let mut rev_bar = String::with_capacity(22);
+    rev_bar.push('│');
+    for i in 0..20 {
+        rev_bar.push(if i < rev_filled { '█' } else { '░' });
+    }
+    rev_bar.push('│');
 
     let slider_width = 21usize; // index 10 = exact 0% Brown center
     let center = slider_width / 2;
@@ -412,6 +651,24 @@ fn render(
         accent_bold: false,
         accent_color: Color::White,
     };
+    let rev_color = if reverb_enabled {
+        Color::Green
+    } else {
+        Color::DarkGrey
+    };
+    let rev_row = Row {
+        label: "reverb".to_string(),
+        value: format!("{rev_bar} {:>3}%", reverb_mix.min(100)),
+        bold_value: true,
+        value_color: rev_color,
+        accent: Some(if reverb_enabled { " on" } else { "off" }.to_string()),
+        accent_bold: reverb_enabled,
+        accent_color: if reverb_enabled {
+            Color::Green
+        } else {
+            Color::DarkGrey
+        },
+    };
     let volume_row = Row {
         label: "volume".to_string(),
         value: format!("{bar} {:>3}%", volume),
@@ -423,14 +680,14 @@ fn render(
     };
     let controls = Row {
         label: "controls".to_string(),
-        value: "↑/↓ vol  ←/→ cycle  +/- range  o osc  q quit".to_string(),
+        value: "↑/↓ vol  ←/→ cycle  +/- range  o osc  r/[/] rev  q quit".to_string(),
         bold_value: false,
         value_color: Color::DarkGrey,
         accent: None,
         accent_bold: false,
         accent_color: Color::White,
     };
-    let rows = [mode, osc, volume_row, controls];
+    let rows = [mode, osc, rev_row, volume_row, controls];
 
     // Top border with a centered title and a bottom border, both sized to the
     // live width (no hand-counted dashes).
@@ -511,11 +768,7 @@ fn spawn_sigint_handler(running: Arc<AtomicBool>) {
 fn main() {
     // Shared state between the audio thread and the keyboard event loop.
     let running = Arc::new(AtomicBool::new(true));
-    let volume = Arc::new(AtomicU8::new(20));
-    let osc_enabled = Arc::new(AtomicBool::new(true));
-    let osc_secs = Arc::new(AtomicUsize::new(30)); // 30s full oscillation cycle
-    let osc_amount = Arc::new(AtomicU8::new(25)); // ±25% away from Brown
-    let osc_pos = Arc::new(AtomicI8::new(0)); // current position in -100..=100%
+    let params = Arc::new(AudioParams::new());
 
     // Start audio.
     let host = cpal::default_host();
@@ -526,14 +779,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let stream = match create_stream(
-        &device,
-        volume.clone(),
-        osc_enabled.clone(),
-        osc_secs.clone(),
-        osc_amount.clone(),
-        osc_pos.clone(),
-    ) {
+    let stream = match create_stream(&device, params.clone()) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: {e}");
@@ -553,20 +799,24 @@ fn main() {
 
     // Initial paint.
     let _ = render(
-        volume.load(Ordering::Relaxed),
-        osc_enabled.load(Ordering::Relaxed),
-        osc_secs.load(Ordering::Relaxed),
-        osc_amount.load(Ordering::Relaxed),
-        osc_pos.load(Ordering::Relaxed),
+        params.volume.load(Ordering::Relaxed),
+        params.osc_enabled.load(Ordering::Relaxed),
+        params.osc_secs.load(Ordering::Relaxed),
+        params.osc_amount.load(Ordering::Relaxed),
+        params.osc_pos.load(Ordering::Relaxed),
+        params.reverb_enabled.load(Ordering::Relaxed),
+        params.reverb_mix.load(Ordering::Relaxed),
     );
 
     // Event loop: poll with a short timeout so we can also react to the
     // signal handler thread and animate the oscillation slider.
-    let mut last_volume = volume.load(Ordering::Relaxed);
-    let mut last_enabled = osc_enabled.load(Ordering::Relaxed);
-    let mut last_osc_secs = osc_secs.load(Ordering::Relaxed);
-    let mut last_osc_amount = osc_amount.load(Ordering::Relaxed);
-    let mut last_osc_pos = osc_pos.load(Ordering::Relaxed);
+    let mut last_volume = params.volume.load(Ordering::Relaxed);
+    let mut last_enabled = params.osc_enabled.load(Ordering::Relaxed);
+    let mut last_osc_secs = params.osc_secs.load(Ordering::Relaxed);
+    let mut last_osc_amount = params.osc_amount.load(Ordering::Relaxed);
+    let mut last_osc_pos = params.osc_pos.load(Ordering::Relaxed);
+    let mut last_reverb_enabled = params.reverb_enabled.load(Ordering::Relaxed);
+    let mut last_reverb_mix = params.reverb_mix.load(Ordering::Relaxed);
     loop {
         if !running.load(Ordering::Relaxed) {
             break;
@@ -586,36 +836,60 @@ fn main() {
 
                     match key.code {
                         KeyCode::Up => {
-                            let v = volume.load(Ordering::Relaxed);
+                            let v = params.volume.load(Ordering::Relaxed);
                             if v < 100 {
-                                volume.store(v.saturating_add(5).min(100), Ordering::Relaxed);
+                                params
+                                    .volume
+                                    .store(v.saturating_add(5).min(100), Ordering::Relaxed);
                             }
                         }
                         KeyCode::Down => {
-                            let v = volume.load(Ordering::Relaxed);
+                            let v = params.volume.load(Ordering::Relaxed);
                             if v > 0 {
-                                volume.store(v.saturating_sub(5), Ordering::Relaxed);
+                                params.volume.store(v.saturating_sub(5), Ordering::Relaxed);
                             }
                         }
                         KeyCode::Right => {
-                            let s = osc_secs.load(Ordering::Relaxed);
-                            osc_secs.store((s + 5).min(300), Ordering::Relaxed);
+                            let s = params.osc_secs.load(Ordering::Relaxed);
+                            params.osc_secs.store((s + 5).min(300), Ordering::Relaxed);
                         }
                         KeyCode::Left => {
-                            let s = osc_secs.load(Ordering::Relaxed);
-                            osc_secs.store(s.saturating_sub(5).max(5), Ordering::Relaxed);
+                            let s = params.osc_secs.load(Ordering::Relaxed);
+                            params
+                                .osc_secs
+                                .store(s.saturating_sub(5).max(5), Ordering::Relaxed);
                         }
                         KeyCode::Char('+') | KeyCode::Char('=') => {
-                            let a = osc_amount.load(Ordering::Relaxed);
-                            osc_amount.store(a.saturating_add(5).min(100), Ordering::Relaxed);
+                            let a = params.osc_amount.load(Ordering::Relaxed);
+                            params
+                                .osc_amount
+                                .store(a.saturating_add(5).min(100), Ordering::Relaxed);
                         }
                         KeyCode::Char('-') | KeyCode::Char('_') => {
-                            let a = osc_amount.load(Ordering::Relaxed);
-                            osc_amount.store(a.saturating_sub(5).max(5), Ordering::Relaxed);
+                            let a = params.osc_amount.load(Ordering::Relaxed);
+                            params
+                                .osc_amount
+                                .store(a.saturating_sub(5).max(5), Ordering::Relaxed);
                         }
                         KeyCode::Char('o') | KeyCode::Char('O') | KeyCode::Char(' ') => {
-                            let next = !osc_enabled.load(Ordering::Relaxed);
-                            osc_enabled.store(next, Ordering::Relaxed);
+                            let next = !params.osc_enabled.load(Ordering::Relaxed);
+                            params.osc_enabled.store(next, Ordering::Relaxed);
+                        }
+                        KeyCode::Char('r') | KeyCode::Char('R') => {
+                            let next = !params.reverb_enabled.load(Ordering::Relaxed);
+                            params.reverb_enabled.store(next, Ordering::Relaxed);
+                        }
+                        KeyCode::Char(']') => {
+                            let m = params.reverb_mix.load(Ordering::Relaxed);
+                            params
+                                .reverb_mix
+                                .store(m.saturating_add(5).min(100), Ordering::Relaxed);
+                        }
+                        KeyCode::Char('[') => {
+                            let m = params.reverb_mix.load(Ordering::Relaxed);
+                            params
+                                .reverb_mix
+                                .store(m.saturating_sub(5).max(5), Ordering::Relaxed);
                         }
                         KeyCode::Char('q') | KeyCode::Esc => {
                             running.store(false, Ordering::SeqCst);
@@ -635,16 +909,20 @@ fn main() {
         }
 
         // Redraw only when something changed, to avoid flicker.
-        let cur_volume = volume.load(Ordering::Relaxed);
-        let cur_enabled = osc_enabled.load(Ordering::Relaxed);
-        let cur_osc_secs = osc_secs.load(Ordering::Relaxed);
-        let cur_osc_amount = osc_amount.load(Ordering::Relaxed);
-        let cur_osc_pos = osc_pos.load(Ordering::Relaxed);
+        let cur_volume = params.volume.load(Ordering::Relaxed);
+        let cur_enabled = params.osc_enabled.load(Ordering::Relaxed);
+        let cur_osc_secs = params.osc_secs.load(Ordering::Relaxed);
+        let cur_osc_amount = params.osc_amount.load(Ordering::Relaxed);
+        let cur_osc_pos = params.osc_pos.load(Ordering::Relaxed);
+        let cur_reverb_enabled = params.reverb_enabled.load(Ordering::Relaxed);
+        let cur_reverb_mix = params.reverb_mix.load(Ordering::Relaxed);
         let pos_changed = cur_enabled && cur_osc_pos != last_osc_pos;
         if cur_volume != last_volume
             || cur_enabled != last_enabled
             || cur_osc_secs != last_osc_secs
             || cur_osc_amount != last_osc_amount
+            || cur_reverb_enabled != last_reverb_enabled
+            || cur_reverb_mix != last_reverb_mix
             || pos_changed
         {
             last_volume = cur_volume;
@@ -652,12 +930,16 @@ fn main() {
             last_osc_secs = cur_osc_secs;
             last_osc_amount = cur_osc_amount;
             last_osc_pos = cur_osc_pos;
+            last_reverb_enabled = cur_reverb_enabled;
+            last_reverb_mix = cur_reverb_mix;
             let _ = render(
                 cur_volume,
                 cur_enabled,
                 cur_osc_secs,
                 cur_osc_amount,
                 cur_osc_pos,
+                cur_reverb_enabled,
+                cur_reverb_mix,
             );
         }
     }
@@ -721,5 +1003,56 @@ mod tests {
             let s = format_signed_pct(v);
             assert_eq!(s.len(), 5, "unexpected width for {v}: {s:?}");
         }
+    }
+
+    #[test]
+    fn reverb_disabled_outputs_dry_signal() {
+        let mut reverb = Reverb::new(48_000.0, 2);
+        reverb.begin_frame(false, 50);
+        assert_eq!(reverb.process_channel(0, 0.42), 0.42);
+        assert_eq!(reverb.process_channel(1, -0.37), -0.37);
+    }
+
+    #[test]
+    fn reverb_is_bounded_and_stereo_decorrelated() {
+        let sr = 48_000.0;
+        let mut r#gen = NoiseGen::new(sr * 2.0);
+        let mut reverb = Reverb::new(sr, 2);
+
+        let mut dry_sq = 0.0;
+        let mut wet_sq = 0.0;
+        let mut diff_sq = 0.0;
+        let frames = 48_000 * 3; // 3 seconds
+
+        for i in 0..frames {
+            reverb.begin_frame(true, 100);
+            let d = r#gen.sample(false, 30, 25);
+            let l = reverb.process_channel(0, d);
+            let r = reverb.process_channel(1, d);
+            assert!(l.is_finite() && r.is_finite());
+            assert!(
+                l.abs() < 2.0 && r.abs() < 2.0,
+                "reverb blew up: l={l}, r={r}"
+            );
+            if i >= 48_000 {
+                dry_sq += d * d;
+                wet_sq += 0.5 * (l * l + r * r);
+                diff_sq += (l - r) * (l - r);
+            }
+        }
+
+        let dry_rms = (dry_sq / (frames - 48_000) as f64).sqrt();
+        let wet_rms = (wet_sq / (frames - 48_000) as f64).sqrt();
+        let diff_rms = (diff_sq / (frames - 48_000) as f64).sqrt();
+        let ratio = wet_rms / dry_rms;
+
+        assert!(
+            (0.4..=1.5).contains(&ratio),
+            "unexpected wet/dry RMS ratio: {ratio:.3} (dry={dry_rms:.4}, wet={wet_rms:.4})"
+        );
+        assert!(
+            diff_rms > wet_rms * 0.5,
+            "stereo channels should be decorrelated: diff_rms={diff_rms:.4}, wet_rms={wet_rms:.4}"
+        );
     }
 }
