@@ -12,7 +12,7 @@
 /// * `[` / `]`        — decrease / increase reverb wet mix (5% steps).
 /// * `q` or `Esc`     — quit.
 /// * `Ctrl+C`         — quit.
-use std::io::stdout;
+use std::io::{Write, stdout};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU8, AtomicUsize, Ordering};
 use std::thread;
@@ -21,7 +21,7 @@ use std::time::Duration;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream};
 use crossterm::Command;
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{self, MoveTo};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::style::{
@@ -475,55 +475,76 @@ struct Row {
 }
 
 impl Row {
-    /// Render the row as `[left-pad][label][gap][value][gap][right-pad][accent]`.
+    /// Render the row as `[left-pad][label][gap][value][gap][right-pad][accent][right-margin]`.
     ///
-    /// `inner_width` is the box interior (terminal width minus the 4 border
-    /// columns). The right padding is computed so the accent sits flush against
-    /// the right border. If the content is wider than the terminal (a very
-    /// narrow viewport) the padding clamps to zero so we degrade gracefully
-    /// instead of overflowing the box.
-    fn cells(&self, inner_width: usize) -> Vec<Cell> {
-        let label_w = self.label.chars().count();
-        let value_w = self.value.chars().count();
+    /// `inner_width` is the box interior between the left and right `│`
+    /// borders (`terminal_width - 2`). Labels are padded to `label_width` so
+    /// every row's value column starts at the same column, right-aligned
+    /// accents sit 2 columns inside the right border, and any overflow on a
+    /// narrow terminal is truncated so the row never wraps past the border.
+    fn cells(&self, inner_width: usize, label_width: usize) -> Vec<Cell> {
+        const LEFT_PAD: &str = "  ";
+        const GAP1: &str = "  ";
+        const GAP2: &str = "  ";
+        const RIGHT_MARGIN: &str = "  ";
+
+        let label_text = format!("{:<width$}", self.label, width = label_width);
         let accent_w = self.accent.as_ref().map_or(0, |a| a.chars().count());
+        let gap2_w = if self.accent.is_some() {
+            GAP2.chars().count()
+        } else {
+            0
+        };
 
-        let left_pad = "  ";
-        let gap1 = "  ";
-        let gap2 = "  ";
+        let overhead = LEFT_PAD.chars().count()
+            + label_text.chars().count()
+            + GAP1.chars().count()
+            + gap2_w
+            + accent_w
+            + RIGHT_MARGIN.chars().count();
 
-        let fixed = left_pad.chars().count()
-            + label_w
-            + gap1.chars().count()
-            + value_w
-            + gap2.chars().count()
-            + accent_w;
+        let avail_for_value = inner_width.saturating_sub(overhead);
+        let value_w = self.value.chars().count();
+        let value_text = if value_w <= avail_for_value {
+            self.value.clone()
+        } else if avail_for_value >= 1 {
+            let mut s: String = self
+                .value
+                .chars()
+                .take(avail_for_value.saturating_sub(1))
+                .collect();
+            if avail_for_value >= 2 {
+                s.push('…');
+            } else {
+                s = self.value.chars().take(1).collect();
+            }
+            s
+        } else {
+            String::new()
+        };
 
-        let right_pad = inner_width.saturating_sub(fixed);
+        let used = overhead + value_text.chars().count();
+        let right_pad = inner_width.saturating_sub(used);
 
         let mut cells = vec![
             Cell {
-                text: left_pad.to_string(),
+                text: LEFT_PAD.to_string(),
                 bold: false,
                 color: Color::Grey,
             },
             Cell {
-                text: self.label.clone(),
+                text: label_text,
                 bold: true,
                 color: Color::White,
             },
             Cell {
-                text: gap1.to_string(),
+                text: GAP1.to_string(),
                 bold: false,
                 color: self.value_color,
             },
             Cell {
-                text: self.value.clone(),
+                text: value_text,
                 bold: self.bold_value,
-                color: self.value_color,
-            },
-            Cell {
-                text: gap2.to_string(),
-                bold: false,
                 color: self.value_color,
             },
         ];
@@ -536,12 +557,40 @@ impl Row {
         }
         if let Some(accent) = &self.accent {
             cells.push(Cell {
+                text: GAP2.to_string(),
+                bold: false,
+                color: self.value_color,
+            });
+            cells.push(Cell {
                 text: accent.clone(),
                 bold: self.accent_bold,
                 color: self.accent_color,
             });
         }
-        cells
+        cells.push(Cell {
+            text: RIGHT_MARGIN.to_string(),
+            bold: false,
+            color: Color::Grey,
+        });
+
+        // Guarantee total character count never exceeds `inner_width`, even on
+        // ultra-narrow terminals where `overhead > inner_width`.
+        let mut remaining = inner_width;
+        let mut trimmed = Vec::with_capacity(cells.len());
+        for mut cell in cells {
+            if remaining == 0 {
+                break;
+            }
+            let len = cell.text.chars().count();
+            if len > remaining {
+                cell.text = cell.text.chars().take(remaining).collect();
+                remaining = 0;
+            } else {
+                remaining -= len;
+            }
+            trimmed.push(cell);
+        }
+        trimmed
     }
 }
 
@@ -558,8 +607,9 @@ fn push_command<C: Command>(out: &mut String, cmd: C) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Paint the status panel describing the current state.
-fn render(
+/// Snapshot of the parameters rendered in the status panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UiState {
     volume: u8,
     osc_enabled: bool,
     osc_secs: usize,
@@ -567,12 +617,40 @@ fn render(
     osc_pos: i8,
     reverb_enabled: bool,
     reverb_mix: u8,
-) -> std::io::Result<()> {
-    // Resolve the actual terminal width so the box always fits the real
-    // viewport instead of a hard-coded ~65-column frame that overflows narrow
-    // terminals or looks sparse on wide ones.
-    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
-    let inner = width.saturating_sub(4); // interior = width - ("│" + "│" + two side spaces)
+}
+
+impl UiState {
+    fn from_params(params: &AudioParams) -> Self {
+        let osc_enabled = params.osc_enabled.load(Ordering::Relaxed);
+        let osc_pos = if osc_enabled {
+            params.osc_pos.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        UiState {
+            volume: params.volume.load(Ordering::Relaxed),
+            osc_enabled,
+            osc_secs: params.osc_secs.load(Ordering::Relaxed),
+            osc_amount: params.osc_amount.load(Ordering::Relaxed),
+            osc_pos,
+            reverb_enabled: params.reverb_enabled.load(Ordering::Relaxed),
+            reverb_mix: params.reverb_mix.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Build the full ANSI frame for a terminal of `width` columns.
+fn build_frame(width: usize, state: UiState) -> std::io::Result<String> {
+    let UiState {
+        volume,
+        osc_enabled,
+        osc_secs,
+        osc_amount,
+        osc_pos,
+        reverb_enabled,
+        reverb_mix,
+    } = state;
+    let inner = width.saturating_sub(2); // everything between left `│` and right `│`
     let border_inner = width.saturating_sub(2); // dash run between ┌ and ┐
 
     let filled = (volume as usize) / 5; // 0..=20 segments
@@ -688,31 +766,38 @@ fn render(
         accent_color: Color::White,
     };
     let rows = [mode, osc, rev_row, volume_row, controls];
+    let label_width = rows
+        .iter()
+        .map(|r| r.label.chars().count())
+        .max()
+        .unwrap_or(0);
 
     // Top border with a centered title and a bottom border, both sized to the
     // live width (no hand-counted dashes).
     let title = " noise ";
     let title_w = title.chars().count();
-    let left_pad = if border_inner > title_w {
-        (border_inner - title_w) / 2
+    let top_inner = if border_inner >= title_w {
+        let left_pad = (border_inner - title_w) / 2;
+        let right_pad = border_inner - title_w - left_pad;
+        format!("{}{}{}", "─".repeat(left_pad), title, "─".repeat(right_pad))
     } else {
-        0
+        "─".repeat(border_inner)
     };
-    let right_pad = if border_inner > title_w {
-        border_inner - title_w - left_pad
+    let top = if width >= 2 {
+        format!("┌{top_inner}┐")
     } else {
-        0
+        String::new()
     };
-    let top = format!(
-        "┌{}{}{}┐",
-        "─".repeat(left_pad),
-        title,
-        "─".repeat(right_pad)
-    );
-    let bottom = format!("└{}┘", "─".repeat(border_inner));
+    let bottom = if width >= 2 {
+        format!("└{}┘", "─".repeat(border_inner))
+    } else {
+        String::new()
+    };
 
     // Serialize every command (styling + text) into a single ANSI string and
-    // write it in one shot.
+    // write it in one shot. Use explicit `MoveTo(0, y)` per line so raw-mode
+    // LF-without-CR and terminal pending-wrap at column `width` never misalign
+    // subsequent rows.
     let mut out = String::with_capacity(1024);
     push_command(&mut out, MoveTo(0, 0))?;
     push_command(&mut out, SetStyle(ContentStyle::default()))?;
@@ -721,8 +806,14 @@ fn render(
     push_command(&mut out, Print(top))?;
     push_command(&mut out, SetAttribute(Attribute::Reset))?;
 
-    for row in &rows {
-        for c in row.cells(inner) {
+    for (idx, row) in rows.iter().enumerate() {
+        push_command(&mut out, MoveTo(0, (idx + 1) as u16))?;
+        if width >= 2 {
+            push_command(&mut out, SetStyle(ContentStyle::default()))?;
+            push_command(&mut out, SetForegroundColor(Color::Grey))?;
+            push_command(&mut out, Print("│"))?;
+        }
+        for c in row.cells(inner, label_width) {
             push_command(
                 &mut out,
                 if c.bold {
@@ -734,20 +825,34 @@ fn render(
             push_command(&mut out, SetForegroundColor(c.color))?;
             push_command(&mut out, Print(c.text))?;
         }
-        push_command(&mut out, SetStyle(ContentStyle::default()))?;
-        push_command(&mut out, SetForegroundColor(Color::Grey))?;
-        push_command(&mut out, Print("│"))?;
-        push_command(&mut out, Print("\n"))?;
+        if width >= 2 {
+            push_command(&mut out, SetStyle(ContentStyle::default()))?;
+            push_command(&mut out, SetForegroundColor(Color::Grey))?;
+            push_command(&mut out, Print("│"))?;
+        }
     }
 
+    push_command(&mut out, MoveTo(0, (rows.len() + 1) as u16))?;
     push_command(&mut out, SetAttribute(Attribute::Bold))?;
     push_command(&mut out, SetForegroundColor(Color::White))?;
     push_command(&mut out, Print(bottom))?;
     push_command(&mut out, SetStyle(ContentStyle::default()))?;
-    push_command(&mut out, Print("\n"))?;
+    push_command(&mut out, MoveTo(0, (rows.len() + 2) as u16))?;
+    push_command(&mut out, Clear(ClearType::FromCursorDown))?;
 
-    std::io::Write::write_all(&mut stdout(), out.as_bytes())?;
-    Ok(())
+    Ok(out)
+}
+
+/// Paint the status panel describing the current state.
+fn render(state: UiState) -> std::io::Result<()> {
+    // Resolve the actual terminal width so the box always fits the real
+    // viewport instead of a hard-coded ~65-column frame that overflows narrow
+    // terminals or looks sparse on wide ones.
+    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let out = build_frame(width, state)?;
+    let mut handle = stdout();
+    handle.write_all(out.as_bytes())?;
+    handle.flush()
 }
 
 /// Block until SIGINT, then flip `running` to false.
@@ -795,33 +900,20 @@ fn main() {
         eprintln!("error: could not enable raw mode: {e}");
         std::process::exit(1);
     }
-    let _ = execute!(stdout(), Clear(ClearType::All));
+    let _ = execute!(stdout(), Clear(ClearType::All), cursor::Hide);
 
     // Initial paint.
-    let _ = render(
-        params.volume.load(Ordering::Relaxed),
-        params.osc_enabled.load(Ordering::Relaxed),
-        params.osc_secs.load(Ordering::Relaxed),
-        params.osc_amount.load(Ordering::Relaxed),
-        params.osc_pos.load(Ordering::Relaxed),
-        params.reverb_enabled.load(Ordering::Relaxed),
-        params.reverb_mix.load(Ordering::Relaxed),
-    );
+    let mut last_state = UiState::from_params(&params);
+    let _ = render(last_state);
 
     // Event loop: poll with a short timeout so we can also react to the
     // signal handler thread and animate the oscillation slider.
-    let mut last_volume = params.volume.load(Ordering::Relaxed);
-    let mut last_enabled = params.osc_enabled.load(Ordering::Relaxed);
-    let mut last_osc_secs = params.osc_secs.load(Ordering::Relaxed);
-    let mut last_osc_amount = params.osc_amount.load(Ordering::Relaxed);
-    let mut last_osc_pos = params.osc_pos.load(Ordering::Relaxed);
-    let mut last_reverb_enabled = params.reverb_enabled.load(Ordering::Relaxed);
-    let mut last_reverb_mix = params.reverb_mix.load(Ordering::Relaxed);
     loop {
         if !running.load(Ordering::Relaxed) {
             break;
         }
 
+        let mut resized = false;
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -898,7 +990,10 @@ fn main() {
                         _ => {}
                     }
                 }
-                // Ignore non-key events and key repeats/releases.
+                Ok(Event::Resize(_, _)) => {
+                    resized = true;
+                }
+                // Ignore other events and key repeats/releases.
                 _ => {}
             },
             Ok(false) => {}
@@ -909,38 +1004,13 @@ fn main() {
         }
 
         // Redraw only when something changed, to avoid flicker.
-        let cur_volume = params.volume.load(Ordering::Relaxed);
-        let cur_enabled = params.osc_enabled.load(Ordering::Relaxed);
-        let cur_osc_secs = params.osc_secs.load(Ordering::Relaxed);
-        let cur_osc_amount = params.osc_amount.load(Ordering::Relaxed);
-        let cur_osc_pos = params.osc_pos.load(Ordering::Relaxed);
-        let cur_reverb_enabled = params.reverb_enabled.load(Ordering::Relaxed);
-        let cur_reverb_mix = params.reverb_mix.load(Ordering::Relaxed);
-        let pos_changed = cur_enabled && cur_osc_pos != last_osc_pos;
-        if cur_volume != last_volume
-            || cur_enabled != last_enabled
-            || cur_osc_secs != last_osc_secs
-            || cur_osc_amount != last_osc_amount
-            || cur_reverb_enabled != last_reverb_enabled
-            || cur_reverb_mix != last_reverb_mix
-            || pos_changed
-        {
-            last_volume = cur_volume;
-            last_enabled = cur_enabled;
-            last_osc_secs = cur_osc_secs;
-            last_osc_amount = cur_osc_amount;
-            last_osc_pos = cur_osc_pos;
-            last_reverb_enabled = cur_reverb_enabled;
-            last_reverb_mix = cur_reverb_mix;
-            let _ = render(
-                cur_volume,
-                cur_enabled,
-                cur_osc_secs,
-                cur_osc_amount,
-                cur_osc_pos,
-                cur_reverb_enabled,
-                cur_reverb_mix,
-            );
+        let cur_state = UiState::from_params(&params);
+        if resized || cur_state != last_state {
+            if resized {
+                let _ = execute!(stdout(), Clear(ClearType::All));
+            }
+            last_state = cur_state;
+            let _ = render(cur_state);
         }
     }
 
@@ -949,8 +1019,8 @@ fn main() {
     // Dropping the stream stops playback.
     drop(stream);
 
-    // Wipe the status panel so nothing is left on screen.
-    let _ = execute!(stdout(), Clear(ClearType::All));
+    // Wipe the status panel and restore the cursor so nothing is left on screen.
+    let _ = execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0), cursor::Show);
 }
 
 #[cfg(test)]
@@ -1054,5 +1124,122 @@ mod tests {
             diff_rms > wet_rms * 0.5,
             "stereo channels should be decorrelated: diff_rms={diff_rms:.4}, wet_rms={wet_rms:.4}"
         );
+    }
+
+    /// Strip ANSI CSI (`\x1b[...<letter>`) sequences so we can inspect the
+    /// visible characters of a rendered frame.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn row_cells_fit_exact_inner_width() {
+        let rows = [
+            Row {
+                label: "mode".to_string(),
+                value: "Brown (oscillating)".to_string(),
+                bold_value: true,
+                value_color: Color::Yellow,
+                accent: None,
+                accent_bold: false,
+                accent_color: Color::White,
+            },
+            Row {
+                label: "osc".to_string(),
+                value: " 30s  ±25%   -[━━━━━━━━━━●━━━━━━━━━━]+".to_string(),
+                bold_value: true,
+                value_color: Color::Magenta,
+                accent: Some("  -3%".to_string()),
+                accent_bold: false,
+                accent_color: Color::White,
+            },
+            Row {
+                label: "controls".to_string(),
+                value: "↑/↓ vol  ←/→ cycle  +/- range  o osc  r/[/] rev  q quit".to_string(),
+                bold_value: false,
+                value_color: Color::DarkGrey,
+                accent: None,
+                accent_bold: false,
+                accent_color: Color::White,
+            },
+        ];
+        for width in [4, 12, 30, 50, 72, 80, 140] {
+            let inner = width - 2;
+            for row in &rows {
+                let total: usize = row
+                    .cells(inner, 8)
+                    .iter()
+                    .map(|c| c.text.chars().count())
+                    .sum();
+                assert_eq!(
+                    total, inner,
+                    "row {:?} mismatched inner width {inner} at terminal width {width}",
+                    row.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_frame_aligns_borders_and_avoids_bare_newlines() {
+        let state = UiState {
+            volume: 20,
+            osc_enabled: true,
+            osc_secs: 30,
+            osc_amount: 25,
+            osc_pos: -3,
+            reverb_enabled: true,
+            reverb_mix: 35,
+        };
+        for width in [12, 40, 80, 150] {
+            let frame = build_frame(width, state).unwrap();
+            assert!(
+                !frame.contains('\n'),
+                "raw-mode frame must not contain bare \\n (width={width})"
+            );
+
+            // Split on explicit row positioning `\x1b[row;1H` (1-based).
+            let mut lines = Vec::new();
+            for row_idx in 1..=7 {
+                let marker = format!("\x1b[{row_idx};1H");
+                let start = frame
+                    .find(&marker)
+                    .unwrap_or_else(|| panic!("missing {marker} at width={width}"))
+                    + marker.len();
+                let next_marker = format!("\x1b[{};1H", row_idx + 1);
+                let end = frame.find(&next_marker).unwrap_or(frame.len());
+                lines.push(strip_ansi(&frame[start..end]));
+            }
+
+            assert_eq!(lines.len(), 7);
+            for (i, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    line.chars().count(),
+                    width,
+                    "line {i} width mismatch at width={width}: {line:?}"
+                );
+                let first = line.chars().next().unwrap();
+                let last = line.chars().last().unwrap();
+                match i {
+                    0 => assert_eq!((first, last), ('┌', '┐')),
+                    6 => assert_eq!((first, last), ('└', '┘')),
+                    _ => assert_eq!((first, last), ('│', '│')),
+                }
+            }
+        }
     }
 }
